@@ -1,0 +1,159 @@
+name: Encode Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_msg_id:
+        description: "Video Message ID"
+        required: true
+      sub_msg_id:
+        description: "Subtitle Message ID"
+        required: false
+      settings:
+        description: "Encoding settings JSON"
+        required: true
+      chat_id:
+        description: "Telegram chat_id"
+        required: true
+      task_id:
+        description: "Task ID"
+        required: true
+      bot_token:
+        description: "Bot Token"
+        required: true
+      api_id:
+        description: "API ID"
+        required: true
+      api_hash:
+        description: "API HASH"
+        required: true
+      status_msg_id:
+        description: "Status Message ID"
+        required: true
+
+jobs:
+  encode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install FFmpeg & Python
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install pyrogram tgcrypto pyaes
+
+      - name: Encode via Pyrogram Worker
+        run: |
+          cat << 'EOF' > worker.py
+          import asyncio, json, os, subprocess, time, re, math
+          from pyrogram import Client
+
+          def humanbytes(size):
+              if not size: return ""
+              power = 2**10; n = 0
+              Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+              while size > power: size /= power; n += 1
+              return str(math.floor(size * 100) / 100) + " " + Dic_powerN[n] + 'B'
+
+          async def prog(current, total, action, app, chat_id, msg_id, start, last):
+              now = time.time()
+              if now - last[0] > 5 or current == total:
+                  last[0] = now
+                  p = round(current * 100 / total, 1) if total > 0 else 0
+                  s = current / (now - start) if (now - start) > 0 else 0
+                  e = round((total - current) / s) if s > 0 else 0
+                  text = f"🐙 **GitHub Action (Live)**\n🔄 **{action}**\n📊 Progress: {p}%\n💾 Size: {humanbytes(current)} / {humanbytes(total)}\n🚀 Speed: {humanbytes(s)}/s\n⏳ ETA: {e}s"
+                  try: await app.edit_message_text(chat_id, msg_id, text)
+                  except: pass
+
+          async def main():
+              app = Client("gh_session", api_id=int("${{ inputs.api_id }}"), api_hash="${{ inputs.api_hash }}", bot_token="${{ inputs.bot_token }}")
+              await app.start()
+              
+              chat_id = int("${{ inputs.chat_id }}")
+              msg_id = int("${{ inputs.status_msg_id }}")
+              v_id = int("${{ inputs.video_msg_id }}")
+              s_id = "${{ inputs.sub_msg_id }}"
+              settings = json.loads('${{ inputs.settings }}')
+              out_name = settings.get("output", "output.mkv")
+              
+              try: await app.edit_message_text(chat_id, msg_id, "🐙 **GitHub Action**\n📥 Requesting Video...")
+              except: pass
+              
+              v_msg = await app.get_messages(chat_id, v_id)
+              start_dl = time.time(); last_dl = [time.time()]
+              v_path = await app.download_media(v_msg, file_name="input.mp4", progress=prog, progress_args=("Downloading Video", app, chat_id, msg_id, start_dl, last_dl))
+              
+              s_path = None
+              if s_id:
+                  s_msg = await app.get_messages(chat_id, int(s_id))
+                  ext = ".srt"
+                  if getattr(s_msg.document, "file_name", ""):
+                      if s_msg.document.file_name.endswith(".ass"): ext = ".ass"
+                      elif s_msg.document.file_name.endswith(".vtt"): ext = ".vtt"
+                  start_ds = time.time(); last_ds = [time.time()]
+                  s_path = await app.download_media(s_msg, file_name=f"sub{ext}", progress=prog, progress_args=("Downloading Subtitle", app, chat_id, msg_id, start_ds, last_ds))
+              
+              vf = []
+              res = settings.get("res", "original")
+              if res != "original":
+                  rmap = {"1080p":"1920:1080", "720p":"1280:720", "480p":"854:480"}
+                  vf.append(f"scale={rmap.get(res, res)}")
+              
+              if s_path:
+                  esc_sub = s_path.replace("\\", "/").replace("'", r"'\''").replace(":", r"\:")
+                  vf.append(f"subtitles='{esc_sub}'")
+              
+              cmd = ['ffmpeg', '-y', '-i', v_path]
+              if vf: cmd += ['-vf', ",".join(vf)]
+              
+              crf = str(settings.get("quality", "23"))
+              preset = settings.get("preset", "fast")
+              cmd += ['-c:v', 'libx264', '-preset', preset, '-crf', crf, '-c:a', 'copy', out_name]
+              
+              duration = 0.0
+              try:
+                  probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", v_path], capture_output=True, text=True)
+                  duration = float(probe.stdout.strip())
+              except: pass
+
+              try: await app.edit_message_text(chat_id, msg_id, "🐙 **GitHub Action**\n🔥 Encoding Started...")
+              except: pass
+
+              process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
+              start_enc = time.time(); last_enc = time.time()
+              
+              while True:
+                  line = await process.stderr.readline()
+                  if not line: break
+                  line = line.decode()
+                  if "time=" in line and duration > 0:
+                      match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+                      if match:
+                          h, m, s = map(float, match.groups())
+                          curr_sec = h * 3600 + m * 60 + s
+                          now = time.time()
+                          if now - last_enc > 8:
+                              last_enc = now
+                              p = round(curr_sec * 100 / duration, 1)
+                              sp = curr_sec / (now - start_enc) if now > start_enc else 0
+                              rem = round((duration - curr_sec) / sp) if sp > 0 else 0
+                              text = f"🐙 **GitHub Action**\n🔥 **Encoding**\n📊 Progress: {p}%\n🚀 Speed: {round(sp, 2)}x\n⏳ ETA: {rem}s"
+                              try: await app.edit_message_text(chat_id, msg_id, text)
+                              except: pass
+
+              await process.wait()
+              
+              try: await app.edit_message_text(chat_id, msg_id, "🐙 **GitHub Action**\n☁️ Initializing Upload...")
+              except: pass
+              
+              start_up = time.time(); last_up = [time.time()]
+              caption = "✅ GitHub Action Complete!\n📁 `" + out_name + "`"
+              await app.send_document(chat_id, out_name, caption=caption, file_name=out_name, progress=prog, progress_args=("Uploading Result", app, chat_id, msg_id, start_up, last_up))
+              
+              try: await app.edit_message_text(chat_id, msg_id, "✅ **GitHub Task Successfully Completed!**")
+              except: pass
+              await app.stop()
+
+          asyncio.run(main())
+          EOF
+          python worker.py
